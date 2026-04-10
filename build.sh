@@ -26,5 +26,5 @@ fi
 
 mkdir build
 cd build
-cmake .. && make -j
+cmake .. -DCMAKE_CXX_FLAGS="-std=c++17" && make -j
 
