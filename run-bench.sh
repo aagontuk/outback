@@ -11,14 +11,14 @@ CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/outback/build/benchs/outback/client"
 CLIENT_NODE="node-1"
 LOG_DIR="$SCRIPT_DIR/results"
 CSV_FILE="$LOG_DIR/throughput.csv"
-NUM_THREADS=2
+NUM_THREADS=64
 mkdir -p "$LOG_DIR"
 
 # Write CSV header
 echo "threads,throughput_ops_per_sec" > "$CSV_FILE"
 
 SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=1 --workloads=ycsbb"
-CLIENT_ARGS_COMMON="--nic_idx=2 --server_addr=10.10.2.1:8888 --seconds=120 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=1 --workloads=ycsbb"
+CLIENT_ARGS_COMMON="--nic_idx=2 --server_addr=10.10.2.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=1 --workloads=ycsbb"
 
 SERVER_READY_WAIT=5   # seconds to wait after launching server before starting client
 MAX_RETRIES=3         # max attempts per iteration before giving up

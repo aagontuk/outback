@@ -163,16 +163,15 @@ void* rolex_client_worker(void* param) {
     r2::Timer t;
     do {
       auto res = sender.connect(
-        server_addr, "b" + std::to_string(ud_id%FLAGS_mem_threads), 
+        server_addr, "b" + std::to_string(ud_id%FLAGS_mem_threads),
         FLAGS_start_threads+thread_id, ud_qp);
       if (res == IOCode::Ok) {
         LOG(2) << "Thread " << thread_id << " connect to remote server";
         break;
       }
-      if (t.passed_sec() >= 30) {
-        ASSERT(false) << "conn failed at thread:" << thread_id;
-      }
-    } while (t.passed_sec() < 10);
+    } while (t.passed_sec() < 30);
+    ASSERT(sender.get_connect_data().has_value())
+        << "conn failed at thread:" << thread_id << " after 30s";
   }
 
   /**
