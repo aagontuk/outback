@@ -3,6 +3,7 @@
 mode="$1"
 ubuntu_version=$(lsb_release -r -s)
 
+skip_ofed=false
 if [ $ubuntu_version == "18.04" ]; then
   wget https://content.mellanox.com/ofed/MLNX_OFED-4.9-5.1.0.0/MLNX_OFED_LINUX-4.9-5.1.0.0-ubuntu18.04-x86_64.tgz
   mv MLNX_OFED_LINUX-4.9-5.1.0.0-ubuntu18.04-x86_64.tgz ofed.tgz
@@ -11,6 +12,9 @@ elif [ $ubuntu_version == "20.04" ]; then
   # wget https://content.mellanox.com/ofed/MLNX_OFED-5.8-5.1.1.2/MLNX_OFED_LINUX-5.8-5.1.1.2-ubuntu20.04-x86_64.tgz
   wget https://content.mellanox.com/ofed/MLNX_OFED-4.9-5.1.0.0/MLNX_OFED_LINUX-4.9-5.1.0.0-ubuntu20.04-x86_64.tgz
   mv MLNX_OFED_LINUX-4.9-5.1.0.0-ubuntu20.04-x86_64.tgz ofed.tgz
+elif [ $ubuntu_version == "24.04" ]; then
+  echo "Ubuntu 24.04 detected, skipping OFED install"
+  skip_ofed=true
 else
   echo "Wrong ubuntu distribution for $mode!"
   exit 0
@@ -22,20 +26,22 @@ sudo apt -y install g++ cmake clang python3-pip numactl sysstat zstd libtbb-dev 
 
 # install anaconda
 mkdir install
-mv ofed.tgz install
-pip install gdown
+sudo apt install python3-gdown
 
 # install ofed
-cd install
-if [ ! -d "./ofed" ]; then
-  tar zxf ofed.tgz
-  mv MLNX* ofed
+if [ "$skip_ofed" = false ]; then
+  mv ofed.tgz install
+  cd install
+  if [ ! -d "./ofed" ]; then
+    tar zxf ofed.tgz
+    mv MLNX* ofed
+  fi
+  cd ofed
+  sudo ./mlnxofedinstall --force
+  sudo /etc/init.d/openibd restart
+  sudo /etc/init.d/opensmd restart
+  cd ../..
 fi
-cd ofed
-sudo ./mlnxofedinstall --force
-sudo /etc/init.d/openibd restart
-sudo /etc/init.d/opensmd restart
-cd ..
 
 # install cmake
 cd install
