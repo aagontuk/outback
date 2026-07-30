@@ -87,7 +87,7 @@ for dist in $DISTS; do
     fi
 
     SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
-    CLIENT_ARGS_COMMON="--nic_idx=2 --server_addr=10.10.2.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=1 --workloads=${workload} --dists=${dist}"
+    CLIENT_ARGS_COMMON="--nic_idx=2 --server_addr=10.10.2.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
 
     echo "###################################################"
     echo "[bench] server_threads=$server_threads workload=$workload dist=$dist"
