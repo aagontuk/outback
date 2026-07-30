@@ -45,12 +45,16 @@ fi
 
 # install cmake
 cd install
-if [ ! -f cmake-3.16.8.tar.gz ]; then
-  wget https://cmake.org/files/v3.16/cmake-3.16.8.tar.gz
-fi
-if [ ! -d "./cmake-3.16.8" ]; then
-  tar zxf cmake-3.16.8.tar.gz
-  cd cmake-3.16.8 && ./configure && make -j 4 && sudo make install
+if command -v cmake >/dev/null 2>&1 && dpkg --compare-versions "$(cmake --version | head -1 | awk '{print $3}')" ge "3.16.8"; then
+  echo "cmake $(cmake --version | head -1 | awk '{print $3}') already satisfies >= 3.16.8, skipping build"
+else
+  if [ ! -f cmake-3.16.8.tar.gz ]; then
+    wget https://cmake.org/files/v3.16/cmake-3.16.8.tar.gz
+  fi
+  if [ ! -d "./cmake-3.16.8" ]; then
+    tar zxf cmake-3.16.8.tar.gz
+    (cd cmake-3.16.8 && ./configure && make -j 4 && sudo make install)
+  fi
 fi
 cd ..
 
@@ -74,8 +78,13 @@ sudo make
 sudo cp /usr/src/gtest/lib/libgtest*.a /usr/local/lib/
 sudo cp -r /usr/src/gtest/include/gtest /usr/local/include/
 
-# config huge page
-sudo sh -c 'echo 1400 > /proc/sys/vm/nr_hugepages'
+# config huge page (only raise the reservation, never shrink an existing larger one)
+current_hugepages=$(cat /proc/sys/vm/nr_hugepages)
+if [ "$current_hugepages" -lt 1400 ]; then
+  sudo sh -c 'echo 1400 > /proc/sys/vm/nr_hugepages'
+else
+  echo "nr_hugepages already $current_hugepages (>= 1400), leaving as is"
+fi
 cat /proc/meminfo | grep Huge
 
 # kill -9 $(lsof -ti :18515)
