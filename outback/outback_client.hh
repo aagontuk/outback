@@ -41,7 +41,7 @@ auto remote_search(const KeyType& key, RPC& rpc, UDTransport& sender,
     .set_rpc_id(GET)
     .set_corid(R2_COR_ID())
     .add_one_reply(rpc.reply_station,
-                   { .mem_ptr = reply_buf, .sz = sizeof(ReplyValue) })
+                   MemBlock(reply_buf, sizeof(ReplyValue)))
     .add_opaque(data);
     //.add_arg<KeyType>(num);
   ASSERT(rpc.reply_station.cor_ready(R2_COR_ID()) == false);
@@ -76,7 +76,7 @@ void remote_put(const KeyType& key, const ValType& val, RPC& rpc, UDTransport& s
     .set_rpc_id(PUT)
     .set_corid(R2_COR_ID())
     .add_one_reply(rpc.reply_station,
-                   { .mem_ptr = reply_buf, .sz = sizeof(ReplyValue) })
+                   MemBlock(reply_buf, sizeof(ReplyValue)))
     .add_opaque(data);
   ASSERT(op.execute_w_key(&sender, 0) == IOCode::Ok);
 
@@ -116,7 +116,7 @@ void remote_update(const KeyType& key, const ValType& val, RPC& rpc, UDTransport
     .set_rpc_id(UPDATE)
     .set_corid(R2_COR_ID())
     .add_one_reply(rpc.reply_station,
-                   { .mem_ptr = reply_buf, .sz = sizeof(ReplyValue) })
+                   MemBlock(reply_buf, sizeof(ReplyValue)))
     .add_opaque(data);
   ASSERT(op.execute_w_key(&sender, 0) == IOCode::Ok);
 
@@ -137,7 +137,7 @@ void remote_remove(const KeyType& key, RPC& rpc, UDTransport& sender, R2_ASYNC)
     .set_rpc_id(DELETE)
     .set_corid(R2_COR_ID())
     .add_one_reply(rpc.reply_station,
-                   { .mem_ptr = reply_buf, .sz = sizeof(ReplyValue) })
+                   MemBlock(reply_buf, sizeof(ReplyValue)))
     .add_opaque(data);
   ASSERT(op.execute_w_key(&sender, 0) == IOCode::Ok);
 
@@ -159,7 +159,7 @@ void remote_scan(const KeyType& key, const u64& n, RPC& rpc, UDTransport& sender
     .set_rpc_id(SCAN)
     .set_corid(R2_COR_ID())
     .add_one_reply(rpc.reply_station,
-                   { .mem_ptr = reply_buf, .sz = sizeof(ReplyValue) })
+                   MemBlock(reply_buf, sizeof(ReplyValue)))
     .add_opaque(data);
   ASSERT(op.execute_w_key(&sender, 0) == IOCode::Ok);
 

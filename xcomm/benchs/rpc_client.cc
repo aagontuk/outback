@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
                     .set_rpc_id(0)
                     .set_corid(R2_COR_ID())
                     .add_one_reply(rpc.reply_station,
-                                   {.mem_ptr = reply_buf, .sz = 1024})
+                                   MemBlock(reply_buf, 1024))
                     .add_arg<u64>(73);
                 ASSERT(rpc.reply_station.cor_ready(R2_COR_ID()) == false);
                 auto ret = op.execute_w_key(&sender, lkey);

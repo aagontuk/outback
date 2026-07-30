@@ -113,7 +113,7 @@ TEST_F(RPC, basic) {
       .set_req()
       .set_rpc_id(rpc_id)
       .set_corid(2)
-      .add_one_reply(rpc.reply_station, {.mem_ptr = reply_buf, .sz = 1024})
+      .add_one_reply(rpc.reply_station, MemBlock(reply_buf, 1024))
       .add_arg<u64>(73);
   ret = op.execute_w_key(&sender,lkey);
   ASSERT(ret == IOCode::Ok);
@@ -141,7 +141,7 @@ TEST_F(RPC, basic) {
           .set_req()
           .set_rpc_id(rpc_id)
           .set_corid(2)
-          .add_one_reply(rpc.reply_station, {.mem_ptr = reply_buf, .sz = 1024})
+          .add_one_reply(rpc.reply_station, MemBlock(reply_buf, 1024))
           .add_arg<u64>(73);
       ret = op.execute_w_key(&sender, lkey);
       ASSERT(ret == IOCode::Ok);
