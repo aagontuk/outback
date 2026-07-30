@@ -2,7 +2,10 @@
 
 # Benchmark sweep: run server + client across workloads, distributions,
 # server thread counts, and client thread counts.
-# Server runs locally; client runs on node1 via SSH.
+# Server runs locally; client threads are spread across multiple client
+# nodes (node-1..node-4) via SSH, THREADS_PER_NODE threads per node. E.g.
+# with THREADS_PER_NODE=32 and --threads=128, node-1 gets threads 1-32,
+# node-2 gets 33-64, node-3 gets 65-96, node-4 gets 97-128.
 
 set -euo pipefail
 
@@ -15,20 +18,29 @@ usage() {
     echo ""
     echo "Optional:"
     echo "  --min-client-threads=N   Minimum number of client threads (default: 1)"
-    echo "  --max-client-threads=N   Maximum number of client threads (default: 72)"
+    echo "  --max-client-threads=N   Maximum number of client threads (default: 128)"
+    echo "  --client-threads=A,B,C  Comma-separated list of client thread counts to run"
+    echo "                           (e.g. 8,16,32,64) instead of sweeping min..max"
+    echo "  --client-nic-idx=A,B,C,D Comma-separated nic_idx per client node, in the same"
+    echo "                           order as node-1,node-2,node-3,node-4 (default: 0 for all)"
     echo "  --results-dir=PATH       Results directory (default: <script_dir>/results/outback_<timestamp>)"
     exit 1
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_BIN="$SCRIPT_DIR/build/benchs/outback/server"
-CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/outback/build/benchs/outback/client"
-CLIENT_NODE="node-1"
+CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/repos/outback/build/benchs/outback/client"
+CLIENT_NODES=(node-1 node-2 node-3 node-4)
+THREADS_PER_NODE=32
 MIN_CLIENT_THREADS=1
-MAX_CLIENT_THREADS=72
-WORKLOADS="ycsba ycsbb ycsbc"
-DISTS="uniform zipfian"
-SERVER_CORE_START=32  # first core pinned to server; expands to cover all server threads
+MAX_CLIENT_THREADS=128
+CLIENT_THREADS_LIST=""
+CLIENT_NIC_IDX_LIST=""
+# WORKLOADS="ycsba ycsbb ycsbc"
+WORKLOADS="ycsbc"
+# DISTS="uniform zipfian"
+DISTS="zipfian"
+SERVER_CORE_START=0  # first core pinned to server; expands to cover all server threads (server and client run on separate nodes, so no offset is needed; cores 32-63 are offline on this hardware)
 MIN_SERVER_THREADS=""
 MAX_SERVER_THREADS=""
 LOG_DIR=""
@@ -39,6 +51,8 @@ for arg in "$@"; do
         --max-server-threads=*) MAX_SERVER_THREADS="${arg#*=}" ;;
         --min-client-threads=*) MIN_CLIENT_THREADS="${arg#*=}" ;;
         --max-client-threads=*) MAX_CLIENT_THREADS="${arg#*=}" ;;
+        --client-threads=*)     CLIENT_THREADS_LIST="${arg#*=}" ;;
+        --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
         --results-dir=*)        LOG_DIR="${arg#*=}" ;;
         *) echo "Unknown argument: $arg"; usage ;;
     esac
@@ -47,6 +61,25 @@ done
 [ -z "$MIN_SERVER_THREADS" ] && { echo "Error: --min-server-threads is required"; usage; }
 [ -z "$MAX_SERVER_THREADS" ] && { echo "Error: --max-server-threads is required"; usage; }
 [ -z "$LOG_DIR" ] && LOG_DIR="$SCRIPT_DIR/results/outback_$(date +%Y%m%d_%H%M%S)"
+
+# List of client thread counts to sweep over
+if [ -n "$CLIENT_THREADS_LIST" ]; then
+    CLIENT_THREADS_VALUES=(${CLIENT_THREADS_LIST//,/ })
+else
+    CLIENT_THREADS_VALUES=($(seq ${MIN_CLIENT_THREADS} ${MAX_CLIENT_THREADS}))
+fi
+
+# Per-node nic_idx, in the same order as CLIENT_NODES (default: 0 for every node)
+if [ -n "$CLIENT_NIC_IDX_LIST" ]; then
+    CLIENT_NIC_IDX=(${CLIENT_NIC_IDX_LIST//,/ })
+    if [ "${#CLIENT_NIC_IDX[@]}" -ne "${#CLIENT_NODES[@]}" ]; then
+        echo "Error: --client-nic-idx must list exactly ${#CLIENT_NODES[@]} values (one per client node), got ${#CLIENT_NIC_IDX[@]}"
+        usage
+    fi
+else
+    CLIENT_NIC_IDX=()
+    for _node in "${CLIENT_NODES[@]}"; do CLIENT_NIC_IDX+=(0); done
+fi
 
 CSV_FILE="$LOG_DIR/throughput.csv"
 mkdir -p "$LOG_DIR"
@@ -74,8 +107,53 @@ cleanup() {
         sleep 1
     done
     SERVER_PID=""
+
+    # Kill any leftover client processes on all client nodes (best effort, in parallel)
+    for node in "${CLIENT_NODES[@]}"; do
+        ssh "$node" "sudo pkill -f $CLIENT_BIN" 2>/dev/null &
+    done
+    wait 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+# On Ctrl-C/SIGTERM: kill the server and every client node, then actually
+# exit. (Without this, cleanup() alone would run and the script would just
+# continue on to the next loop iteration and re-launch everything.)
+handle_signal() {
+    local sig="$1"
+    trap - INT TERM   # a second Ctrl-C should kill us immediately, not loop through this again
+    echo ""
+    echo "[bench] caught $sig, killing server and all client processes on all nodes..."
+    cleanup
+    trap - EXIT       # avoid running cleanup twice via the EXIT trap below
+    exit 130
+}
+
+trap cleanup EXIT
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
+
+# Splits a total client thread count across CLIENT_NODES, THREADS_PER_NODE
+# threads per node, filling node-1 first, then node-2, etc. Populates the
+# global NODE_THREADS array (one entry per node in CLIENT_NODES, 0 if unused).
+compute_node_threads() {
+    local total=$1
+    local remaining=$total
+    NODE_THREADS=()
+    for _node in "${CLIENT_NODES[@]}"; do
+        if [ "$remaining" -le 0 ]; then
+            NODE_THREADS+=(0)
+            continue
+        fi
+        local n=$remaining
+        [ "$n" -gt "$THREADS_PER_NODE" ] && n=$THREADS_PER_NODE
+        NODE_THREADS+=("$n")
+        remaining=$((remaining - n))
+    done
+    if [ "$remaining" -gt 0 ]; then
+        echo "[bench] ERROR: --threads=$total exceeds capacity of ${#CLIENT_NODES[@]} nodes x ${THREADS_PER_NODE} threads/node"
+        exit 1
+    fi
+}
 
 for server_threads in $(seq ${MIN_SERVER_THREADS} ${MAX_SERVER_THREADS}); do
 for workload in $WORKLOADS; do
@@ -87,33 +165,28 @@ for dist in $DISTS; do
     fi
 
     SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
-    CLIENT_ARGS_COMMON="--nic_idx=2 --server_addr=10.10.2.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
+    CLIENT_ARGS_COMMON="--server_addr=10.10.1.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
 
     echo "###################################################"
     echo "[bench] server_threads=$server_threads workload=$workload dist=$dist"
     echo "###################################################"
 
-    for threads in $(seq ${MIN_CLIENT_THREADS} ${MAX_CLIENT_THREADS}); do
+    for threads in "${CLIENT_THREADS_VALUES[@]}"; do
         echo "========================================"
         echo "[bench] iteration: server_threads=$server_threads workload=$workload dist=$dist threads=$threads"
         echo "========================================"
 
-        # CPU affinity for client: pin to cores 0..(threads-1)
-        if [ "$threads" -eq 1 ]; then
-            CLIENT_CORES="0"
-        else
-            CLIENT_CORES="0-$((threads - 1))"
-        fi
+        # Split $threads client threads across CLIENT_NODES, THREADS_PER_NODE per node
+        compute_node_threads "$threads"
 
         tput_val=""
         for attempt in $(seq 1 $MAX_RETRIES); do
             [ "$attempt" -gt 1 ] && echo "[bench] retrying (attempt $attempt/$MAX_RETRIES)..."
 
-            # Kill any leftover server from a previous iteration or failed attempt
+            # Kill any leftover server/client from a previous iteration or failed attempt
             cleanup
 
             SERVER_LOG="$LOG_DIR/server_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}.log"
-            CLIENT_LOG="$LOG_DIR/client_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}.log"
 
             # Start server in background
             echo "[bench] starting server (cores $SERVER_CORES)..."
@@ -130,21 +203,77 @@ for dist in $DISTS; do
             fi
             echo "[bench] server pid=$SERVER_PID, log=$SERVER_LOG"
 
-            # Run client on node1 via SSH
-            echo "[bench] running client on $CLIENT_NODE with --threads=$threads (cores $CLIENT_CORES)..."
-            if ssh "$CLIENT_NODE" \
-                   "sudo taskset -c $CLIENT_CORES $CLIENT_BIN $CLIENT_ARGS_COMMON --threads=$threads" \
-                   | tee "$CLIENT_LOG"; then
-                echo "[bench] client done, stopping server..."
+            # Launch one client per node in parallel, each pinned to cores
+            # 0..(node_threads-1) on its own node, running its share of threads.
+            CLIENT_PIDS=()
+            CLIENT_LOGS=()
+            CLIENT_NODES_USED=()
+            for i in "${!CLIENT_NODES[@]}"; do
+                node_threads="${NODE_THREADS[$i]}"
+                [ "$node_threads" -eq 0 ] && continue
+                node="${CLIENT_NODES[$i]}"
+
+                if [ "$node_threads" -eq 1 ]; then
+                    node_cores="0"
+                else
+                    node_cores="0-$((node_threads - 1))"
+                fi
+
+                node_nic_idx="${CLIENT_NIC_IDX[$i]}"
+                # Each client thread's UD session is registered on the server keyed
+                # by start_threads+thread_id, which must be globally unique across
+                # all client nodes (server assumes no id collisions). Since every
+                # node numbers its local threads 0..node_threads-1, offset each
+                # node by i*THREADS_PER_NODE so ids never collide across nodes.
+                node_start_threads=$((i * THREADS_PER_NODE))
+                node_log="$LOG_DIR/client_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}_${node}.log"
+                echo "[bench] running client on $node with --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads (cores $node_cores)..."
+                ssh "$node" \
+                    "sudo taskset -c $node_cores $CLIENT_BIN $CLIENT_ARGS_COMMON --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads" \
+                    >"$node_log" 2>&1 &
+
+                CLIENT_PIDS+=("$!")
+                CLIENT_LOGS+=("$node_log")
+                CLIENT_NODES_USED+=("$node")
+            done
+
+            clients_ok=true
+            for i in "${!CLIENT_PIDS[@]}"; do
+                wait "${CLIENT_PIDS[$i]}" && wait_rc=0 || wait_rc=$?
+                if [ "$wait_rc" -ne 0 ]; then
+                    echo "[bench] WARNING: client on ${CLIENT_NODES_USED[$i]} failed (exit $wait_rc), check ${CLIENT_LOGS[$i]}"
+                    clients_ok=false
+                fi
+            done
+
+            # Show client output for visibility, same as the old `tee` behavior
+            for log in "${CLIENT_LOGS[@]}"; do
+                cat "$log"
+            done
+
+            if $clients_ok; then
+                echo "[bench] all clients done, stopping server..."
                 cleanup
 
-                tput_val=$(grep "\[micro\] Throughput(op/s):" "$CLIENT_LOG" | tail -1 | grep -oE '[0-9]+$')
-                if [ -n "$tput_val" ]; then
+                # Total throughput is the sum of each node's reported throughput
+                sum_tput=0
+                parse_ok=true
+                for log in "${CLIENT_LOGS[@]}"; do
+                    node_tput=$(grep "\[micro\] Throughput(op/s):" "$log" | tail -1 | grep -oE '[0-9]+$')
+                    if [ -z "$node_tput" ]; then
+                        parse_ok=false
+                        break
+                    fi
+                    sum_tput=$((sum_tput + node_tput))
+                done
+
+                if $parse_ok; then
+                    tput_val="$sum_tput"
                     break   # success — exit retry loop
                 fi
-                echo "[bench] WARNING: could not parse throughput, retrying..."
+                echo "[bench] WARNING: could not parse throughput from one or more client logs, retrying..."
             else
-                echo "[bench] WARNING: client failed (exit $?), check $CLIENT_LOG"
+                echo "[bench] WARNING: one or more clients failed, retrying..."
                 cleanup
             fi
         done
