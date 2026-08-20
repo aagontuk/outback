@@ -21,6 +21,8 @@ usage() {
     echo "  --max-client-threads=N   Maximum number of client threads (default: 128)"
     echo "  --client-threads=A,B,C  Comma-separated list of client thread counts to run"
     echo "                           (e.g. 8,16,32,64) instead of sweeping min..max"
+    echo "  --client-nodes=A,B,C     Comma-separated list of client nodes to use"
+    echo "                           (default: node-1,node-2,node-3,node-4)"
     echo "  --client-nic-idx=A,B,C,D Comma-separated nic_idx per client node, in the same"
     echo "                           order as node-1,node-2,node-3,node-4 (default: 0 for all)"
     echo "  --results-dir=PATH       Results directory (default: <script_dir>/results/outback_<timestamp>)"
@@ -35,6 +37,7 @@ THREADS_PER_NODE=32
 MIN_CLIENT_THREADS=1
 MAX_CLIENT_THREADS=128
 CLIENT_THREADS_LIST=""
+CLIENT_NODES_LIST=""
 CLIENT_NIC_IDX_LIST=""
 # WORKLOADS="ycsba ycsbb ycsbc"
 WORKLOADS="ycsbc"
@@ -52,6 +55,7 @@ for arg in "$@"; do
         --min-client-threads=*) MIN_CLIENT_THREADS="${arg#*=}" ;;
         --max-client-threads=*) MAX_CLIENT_THREADS="${arg#*=}" ;;
         --client-threads=*)     CLIENT_THREADS_LIST="${arg#*=}" ;;
+        --client-nodes=*)       CLIENT_NODES_LIST="${arg#*=}" ;;
         --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
         --results-dir=*)        LOG_DIR="${arg#*=}" ;;
         *) echo "Unknown argument: $arg"; usage ;;
@@ -61,6 +65,11 @@ done
 [ -z "$MIN_SERVER_THREADS" ] && { echo "Error: --min-server-threads is required"; usage; }
 [ -z "$MAX_SERVER_THREADS" ] && { echo "Error: --max-server-threads is required"; usage; }
 [ -z "$LOG_DIR" ] && LOG_DIR="$SCRIPT_DIR/results/outback_$(date +%Y%m%d_%H%M%S)"
+
+# Override the default client node list if requested
+if [ -n "$CLIENT_NODES_LIST" ]; then
+    CLIENT_NODES=(${CLIENT_NODES_LIST//,/ })
+fi
 
 # List of client thread counts to sweep over
 if [ -n "$CLIENT_THREADS_LIST" ]; then
