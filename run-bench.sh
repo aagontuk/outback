@@ -25,13 +25,15 @@ usage() {
     echo "                           (default: node-1,node-2,node-3,node-4)"
     echo "  --client-nic-idx=A,B,C,D Comma-separated nic_idx per client node, in the same"
     echo "                           order as node-1,node-2,node-3,node-4 (default: 0 for all)"
+    echo "  --numa-node=N            Pin server and client processes to NUMA node N via"
+    echo "                           numactl (cpunodebind+membind), instead of plain taskset"
     echo "  --results-dir=PATH       Results directory (default: <script_dir>/results/outback_<timestamp>)"
     exit 1
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_BIN="$SCRIPT_DIR/build/benchs/outback/server"
-CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/repos/outback/build/benchs/outback/client"
+CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/outback/build/benchs/outback/client"
 CLIENT_NODES=(node-1 node-2 node-3 node-4)
 THREADS_PER_NODE=32
 MIN_CLIENT_THREADS=1
@@ -39,8 +41,8 @@ MAX_CLIENT_THREADS=128
 CLIENT_THREADS_LIST=""
 CLIENT_NODES_LIST=""
 CLIENT_NIC_IDX_LIST=""
-# WORKLOADS="ycsba ycsbb ycsbc"
-WORKLOADS="ycsbc"
+NUMA_NODE=""
+WORKLOADS="ycsba ycsbb ycsbc"
 # DISTS="uniform zipfian"
 DISTS="zipfian"
 SERVER_CORE_START=0  # first core pinned to server; expands to cover all server threads (server and client run on separate nodes, so no offset is needed; cores 32-63 are offline on this hardware)
@@ -57,6 +59,7 @@ for arg in "$@"; do
         --client-threads=*)     CLIENT_THREADS_LIST="${arg#*=}" ;;
         --client-nodes=*)       CLIENT_NODES_LIST="${arg#*=}" ;;
         --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
+        --numa-node=*)          NUMA_NODE="${arg#*=}" ;;
         --results-dir=*)        LOG_DIR="${arg#*=}" ;;
         *) echo "Unknown argument: $arg"; usage ;;
     esac
@@ -88,6 +91,116 @@ if [ -n "$CLIENT_NIC_IDX_LIST" ]; then
 else
     CLIENT_NIC_IDX=()
     for _node in "${CLIENT_NODES[@]}"; do CLIENT_NIC_IDX+=(0); done
+fi
+
+# Builds the core-pinning command prefix for a given core range: plain
+# taskset by default, or numactl (cpunodebind+membind to --numa-node, with
+# --physcpubind restricting to the given cores) when --numa-node is set.
+pin_cmd() {
+    local cores="$1"
+    if [ -n "$NUMA_NODE" ]; then
+        echo "numactl --cpunodebind=$NUMA_NODE --membind=$NUMA_NODE --physcpubind=$cores"
+    else
+        echo "taskset -c $cores"
+    fi
+}
+
+# If --numa-node is set, make sure numactl is present locally (server) and
+# on every client node, installing it via apt where it's missing.
+ensure_numactl() {
+    [ -z "$NUMA_NODE" ] && return
+
+    echo "[bench] checking numactl is installed (--numa-node=$NUMA_NODE)..."
+
+    if ! command -v numactl >/dev/null 2>&1; then
+        echo "[bench] numactl not found locally, installing..."
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y numactl
+    fi
+
+    local pids=()
+    for node in "${CLIENT_NODES[@]}"; do
+        ssh "$node" '
+            if ! command -v numactl >/dev/null 2>&1; then
+                echo "[bench] numactl not found on '"$node"', installing..."
+                sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y numactl
+            fi
+        ' &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || { echo "[bench] ERROR: failed to ensure numactl is installed on a client node"; exit 1; }
+    done
+
+    echo "[bench] numactl check complete."
+}
+ensure_numactl
+
+# Expands a Linux cpulist string like "0-3,8,10-11" into a space-separated
+# list of individual CPU numbers.
+expand_cpulist() {
+    local list="$1" part start end
+    local out=()
+    IFS=',' read -ra parts <<< "$list"
+    for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then
+            start="${part%-*}"
+            end="${part#*-}"
+            for ((c = start; c <= end; c++)); do out+=("$c"); done
+        else
+            out+=("$part")
+        fi
+    done
+    echo "${out[@]}"
+}
+
+# Reads the CPU list belonging to NUMA node $NUMA_NODE straight from
+# /sys/devices/system/node, on the local host if $1 is empty, otherwise over
+# SSH on host $1. This is what guarantees the cores we pin to actually
+# belong to the requested NUMA node, instead of assuming core numbers
+# 0..N-1 happen to live on that node.
+numa_node_cpus() {
+    local host="$1" cpulist
+    if [ -z "$host" ]; then
+        cpulist=$(cat "/sys/devices/system/node/node${NUMA_NODE}/cpulist" 2>/dev/null) || true
+    else
+        cpulist=$(ssh "$host" "cat /sys/devices/system/node/node${NUMA_NODE}/cpulist" 2>/dev/null) || true
+    fi
+    if [ -z "$cpulist" ]; then
+        echo "[bench] ERROR: could not read CPU list for NUMA node $NUMA_NODE on ${host:-local host} (check /sys/devices/system/node/ for valid node numbers)" >&2
+        exit 1
+    fi
+    expand_cpulist "$cpulist"
+}
+
+# Picks the first $1 CPUs out of the space-separated CPU list in $2 and
+# returns them as a comma-separated string (valid for both taskset -c and
+# numactl --physcpubind). Errors out if the NUMA node doesn't have enough.
+cores_from_numa() {
+    local n="$1"
+    local -a cpus=($2)
+    if [ "$n" -gt "${#cpus[@]}" ]; then
+        echo "[bench] ERROR: requested $n threads but NUMA node $NUMA_NODE only has ${#cpus[@]} CPUs available" >&2
+        exit 1
+    fi
+    local -a sel=("${cpus[@]:0:$n}")
+    local IFS=,
+    echo "${sel[*]}"
+}
+
+# Precompute the NUMA node's CPU list once for the local (server) host and
+# every client node, so per-iteration core selection never has to guess.
+if [ -n "$NUMA_NODE" ]; then
+    SERVER_NUMA_CPUS="$(numa_node_cpus "")"
+    echo "[bench] NUMA node $NUMA_NODE CPUs (local/server): $SERVER_NUMA_CPUS"
+
+    CLIENT_NUMA_CPUS=()   # CLIENT_NUMA_CPUS[i] = CPU list string for CLIENT_NODES[i]
+    for node in "${CLIENT_NODES[@]}"; do
+        node_cpus="$(numa_node_cpus "$node")"
+        echo "[bench] NUMA node $NUMA_NODE CPUs on $node: $node_cpus"
+        CLIENT_NUMA_CPUS+=("$node_cpus")
+    done
 fi
 
 CSV_FILE="$LOG_DIR/throughput.csv"
@@ -167,7 +280,9 @@ compute_node_threads() {
 for server_threads in $(seq ${MIN_SERVER_THREADS} ${MAX_SERVER_THREADS}); do
 for workload in $WORKLOADS; do
 for dist in $DISTS; do
-    if [ "$server_threads" -eq 1 ]; then
+    if [ -n "$NUMA_NODE" ]; then
+        SERVER_CORES="$(cores_from_numa "$server_threads" "$SERVER_NUMA_CPUS")"
+    elif [ "$server_threads" -eq 1 ]; then
         SERVER_CORES="$SERVER_CORE_START"
     else
         SERVER_CORES="$SERVER_CORE_START-$((SERVER_CORE_START + server_threads - 1))"
@@ -198,8 +313,9 @@ for dist in $DISTS; do
             SERVER_LOG="$LOG_DIR/server_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}.log"
 
             # Start server in background
-            echo "[bench] starting server (cores $SERVER_CORES)..."
-            sudo taskset -c "$SERVER_CORES" "$SERVER_BIN" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+            SERVER_PIN="$(pin_cmd "$SERVER_CORES")"
+            echo "[bench] starting server (cores $SERVER_CORES, pin: $SERVER_PIN)..."
+            sudo $SERVER_PIN "$SERVER_BIN" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
 
             sleep "$SERVER_READY_WAIT"
 
@@ -222,7 +338,9 @@ for dist in $DISTS; do
                 [ "$node_threads" -eq 0 ] && continue
                 node="${CLIENT_NODES[$i]}"
 
-                if [ "$node_threads" -eq 1 ]; then
+                if [ -n "$NUMA_NODE" ]; then
+                    node_cores="$(cores_from_numa "$node_threads" "${CLIENT_NUMA_CPUS[$i]}")"
+                elif [ "$node_threads" -eq 1 ]; then
                     node_cores="0"
                 else
                     node_cores="0-$((node_threads - 1))"
@@ -235,10 +353,11 @@ for dist in $DISTS; do
                 # node numbers its local threads 0..node_threads-1, offset each
                 # node by i*THREADS_PER_NODE so ids never collide across nodes.
                 node_start_threads=$((i * THREADS_PER_NODE))
+                node_pin="$(pin_cmd "$node_cores")"
                 node_log="$LOG_DIR/client_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}_${node}.log"
-                echo "[bench] running client on $node with --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads (cores $node_cores)..."
+                echo "[bench] running client on $node with --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads (cores $node_cores, pin: $node_pin)..."
                 ssh "$node" \
-                    "sudo taskset -c $node_cores $CLIENT_BIN $CLIENT_ARGS_COMMON --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads" \
+                    "sudo $node_pin $CLIENT_BIN $CLIENT_ARGS_COMMON --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads" \
                     >"$node_log" 2>&1 &
 
                 CLIENT_PIDS+=("$!")
