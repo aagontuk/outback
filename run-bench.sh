@@ -25,9 +25,12 @@ usage() {
     echo "                           (default: node-1,node-2,node-3,node-4)"
     echo "  --client-nic-idx=A,B,C,D Comma-separated nic_idx per client node, in the same"
     echo "                           order as node-1,node-2,node-3,node-4 (default: 0 for all)"
+    echo "  --server-nic-idx=N       nic_idx the server binds its RDMA QPs to (default: 0)"
     echo "  --numa-node=N            Pin server and client processes to NUMA node N via"
     echo "                           numactl (cpunodebind+membind), instead of plain taskset"
     echo "  --results-dir=PATH       Results directory (default: <script_dir>/results/outback_<timestamp>)"
+    echo "  --resume                 Append to the existing CSV in --results-dir instead of"
+    echo "                           creating a new one (requires --results-dir)"
     exit 1
 }
 
@@ -41,6 +44,7 @@ MAX_CLIENT_THREADS=128
 CLIENT_THREADS_LIST=""
 CLIENT_NODES_LIST=""
 CLIENT_NIC_IDX_LIST=""
+SERVER_NIC_IDX=0
 NUMA_NODE=""
 WORKLOADS="ycsba ycsbb ycsbc"
 # DISTS="uniform zipfian"
@@ -49,6 +53,7 @@ SERVER_CORE_START=0  # first core pinned to server; expands to cover all server 
 MIN_SERVER_THREADS=""
 MAX_SERVER_THREADS=""
 LOG_DIR=""
+RESUME=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -59,14 +64,17 @@ for arg in "$@"; do
         --client-threads=*)     CLIENT_THREADS_LIST="${arg#*=}" ;;
         --client-nodes=*)       CLIENT_NODES_LIST="${arg#*=}" ;;
         --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
+        --server-nic-idx=*)     SERVER_NIC_IDX="${arg#*=}" ;;
         --numa-node=*)          NUMA_NODE="${arg#*=}" ;;
         --results-dir=*)        LOG_DIR="${arg#*=}" ;;
+        --resume)               RESUME=1 ;;
         *) echo "Unknown argument: $arg"; usage ;;
     esac
 done
 
 [ -z "$MIN_SERVER_THREADS" ] && { echo "Error: --min-server-threads is required"; usage; }
 [ -z "$MAX_SERVER_THREADS" ] && { echo "Error: --max-server-threads is required"; usage; }
+[ -n "$RESUME" ] && [ -z "$LOG_DIR" ] && { echo "Error: --resume requires --results-dir"; usage; }
 [ -z "$LOG_DIR" ] && LOG_DIR="$SCRIPT_DIR/results/outback_$(date +%Y%m%d_%H%M%S)"
 
 # Override the default client node list if requested
@@ -206,8 +214,12 @@ fi
 CSV_FILE="$LOG_DIR/throughput.csv"
 mkdir -p "$LOG_DIR"
 
-# Write CSV header
-echo "threads,client_threads,workload,dist,throughput_ops_per_sec" > "$CSV_FILE"
+if [ -n "$RESUME" ] && [ -f "$CSV_FILE" ]; then
+    echo "[bench] --resume: appending to existing $CSV_FILE"
+else
+    # Write CSV header (fresh run, or --resume with no prior CSV to resume from)
+    echo "threads,client_threads,workload,dist,throughput_ops_per_sec" > "$CSV_FILE"
+fi
 
 SERVER_READY_WAIT=5   # seconds to wait after launching server before starting client
 MAX_RETRIES=3         # max attempts per iteration before giving up
@@ -288,7 +300,12 @@ for dist in $DISTS; do
         SERVER_CORES="$SERVER_CORE_START-$((SERVER_CORE_START + server_threads - 1))"
     fi
 
-    SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
+    # --seconds=600 (server lifetime = FLAGS_seconds+10, see server.cc) so the
+    # server comfortably outlives the client's own 64M-key index build, which
+    # is single-threaded and can take well over 10 minutes; a server that
+    # exits before the client finishes connecting leaves every client RPC
+    # waiting on a reply that will never come, hanging pthread_join forever.
+    SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist} --nic_idx=${SERVER_NIC_IDX}"
     CLIENT_ARGS_COMMON="--server_addr=10.10.1.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
 
     echo "###################################################"
