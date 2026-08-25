@@ -28,6 +28,10 @@ usage() {
     echo "  --server-nic-idx=N       nic_idx the server binds its RDMA QPs to (default: 0)"
     echo "  --numa-node=N            Pin server and client processes to NUMA node N via"
     echo "                           numactl (cpunodebind+membind), instead of plain taskset"
+    echo "  --server-timeout=N       Server --seconds value; actual server lifetime is N+10"
+    echo "                           seconds (default: 600)"
+    echo "  --client-timeout=N       Max seconds to wait for a client on a node to finish"
+    echo "                           before treating it as hung and retrying (default: 650)"
     echo "  --results-dir=PATH       Results directory (default: <script_dir>/results/outback_<timestamp>)"
     echo "  --resume                 Append to the existing CSV in --results-dir instead of"
     echo "                           creating a new one (requires --results-dir)"
@@ -46,8 +50,12 @@ CLIENT_NODES_LIST=""
 CLIENT_NIC_IDX_LIST=""
 SERVER_NIC_IDX=0
 NUMA_NODE=""
-WORKLOADS="ycsba ycsbb ycsbc"
+SERVER_TIMEOUT=600
+CLIENT_TIMEOUT=650
+# WORKLOADS="ycsba ycsbb ycsbc"
+WORKLOADS="ycsba"
 # DISTS="uniform zipfian"
+# DISTS="uniform"
 DISTS="zipfian"
 SERVER_CORE_START=0  # first core pinned to server; expands to cover all server threads (server and client run on separate nodes, so no offset is needed; cores 32-63 are offline on this hardware)
 MIN_SERVER_THREADS=""
@@ -66,6 +74,8 @@ for arg in "$@"; do
         --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
         --server-nic-idx=*)     SERVER_NIC_IDX="${arg#*=}" ;;
         --numa-node=*)          NUMA_NODE="${arg#*=}" ;;
+        --server-timeout=*)     SERVER_TIMEOUT="${arg#*=}" ;;
+        --client-timeout=*)     CLIENT_TIMEOUT="${arg#*=}" ;;
         --results-dir=*)        LOG_DIR="${arg#*=}" ;;
         --resume)               RESUME=1 ;;
         *) echo "Unknown argument: $arg"; usage ;;
@@ -300,12 +310,14 @@ for dist in $DISTS; do
         SERVER_CORES="$SERVER_CORE_START-$((SERVER_CORE_START + server_threads - 1))"
     fi
 
-    # --seconds=600 (server lifetime = FLAGS_seconds+10, see server.cc) so the
-    # server comfortably outlives the client's own 64M-key index build, which
-    # is single-threaded and can take well over 10 minutes; a server that
-    # exits before the client finishes connecting leaves every client RPC
-    # waiting on a reply that will never come, hanging pthread_join forever.
-    SERVER_ARGS="--seconds=600 --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist} --nic_idx=${SERVER_NIC_IDX}"
+    # --seconds=$SERVER_TIMEOUT (server lifetime = FLAGS_seconds+10, see
+    # server.cc) so the server comfortably outlives the client's own 64M-key
+    # index build, which is single-threaded and can take well over 10
+    # minutes; a server that exits before the client finishes connecting
+    # leaves every client RPC waiting on a reply that will never come,
+    # hanging pthread_join forever. --client-timeout bounds that hang instead
+    # of leaving it to run forever (see the wait loop below).
+    SERVER_ARGS="--seconds=${SERVER_TIMEOUT} --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist} --nic_idx=${SERVER_NIC_IDX}"
     CLIENT_ARGS_COMMON="--server_addr=10.10.1.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
 
     echo "###################################################"
@@ -372,8 +384,14 @@ for dist in $DISTS; do
                 node_start_threads=$((i * THREADS_PER_NODE))
                 node_pin="$(pin_cmd "$node_cores")"
                 node_log="$LOG_DIR/client_st${server_threads}_${workload}_${dist}_t${threads}_attempt${attempt}_${node}.log"
-                echo "[bench] running client on $node with --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads (cores $node_cores, pin: $node_pin)..."
-                ssh "$node" \
+                echo "[bench] running client on $node with --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads (cores $node_cores, pin: $node_pin, timeout: ${CLIENT_TIMEOUT}s)..."
+                # timeout bounds a hung/stuck client (e.g. server already exited,
+                # per the comment above) so a wedged iteration fails fast instead
+                # of blocking the whole sweep forever; -k gives it 10s to die
+                # cleanly before SIGKILL. This only kills the local ssh process —
+                # cleanup() below still pkills the remote client binary on every
+                # node to mop up anything left running server-side.
+                timeout -k 10 "${CLIENT_TIMEOUT}s" ssh "$node" \
                     "sudo $node_pin $CLIENT_BIN $CLIENT_ARGS_COMMON --threads=$node_threads --nic_idx=$node_nic_idx --start_threads=$node_start_threads" \
                     >"$node_log" 2>&1 &
 
@@ -385,7 +403,10 @@ for dist in $DISTS; do
             clients_ok=true
             for i in "${!CLIENT_PIDS[@]}"; do
                 wait "${CLIENT_PIDS[$i]}" && wait_rc=0 || wait_rc=$?
-                if [ "$wait_rc" -ne 0 ]; then
+                if [ "$wait_rc" -eq 124 ]; then
+                    echo "[bench] WARNING: client on ${CLIENT_NODES_USED[$i]} timed out after ${CLIENT_TIMEOUT}s (hung?), check ${CLIENT_LOGS[$i]}"
+                    clients_ok=false
+                elif [ "$wait_rc" -ne 0 ]; then
                     echo "[bench] WARNING: client on ${CLIENT_NODES_USED[$i]} failed (exit $wait_rc), check ${CLIENT_LOGS[$i]}"
                     clients_ok=false
                 fi
