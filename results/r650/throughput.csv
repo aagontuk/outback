@@ -1,0 +1,5 @@
+threads,throughput_ops_per_sec
+8,3.3
+16,3.9
+32,3.2
+72,4.6
