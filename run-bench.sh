@@ -26,6 +26,8 @@ usage() {
     echo "  --client-nic-idx=A,B,C,D Comma-separated nic_idx per client node, in the same"
     echo "                           order as node-1,node-2,node-3,node-4 (default: 0 for all)"
     echo "  --server-nic-idx=N       nic_idx the server binds its RDMA QPs to (default: 0)"
+    echo "  --server-addr=IP:PORT    RDMA address clients connect to, i.e. the server's"
+    echo "                           RDMA-capable interface (default: 10.10.1.2:8888)"
     echo "  --numa-node=N            Pin server and client processes to NUMA node N via"
     echo "                           numactl (cpunodebind+membind), instead of plain taskset"
     echo "  --server-timeout=N       Server --seconds value; actual server lifetime is N+10"
@@ -40,7 +42,7 @@ usage() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_BIN="$SCRIPT_DIR/build/benchs/outback/server"
-CLIENT_BIN="/proj/sandstorm-PG0/ashfaq/outback/build/benchs/outback/client"
+CLIENT_BIN="$(dirname "$SERVER_BIN")/client"
 CLIENT_NODES=(node-1 node-2 node-3 node-4)
 THREADS_PER_NODE=32
 MIN_CLIENT_THREADS=1
@@ -49,15 +51,13 @@ CLIENT_THREADS_LIST=""
 CLIENT_NODES_LIST=""
 CLIENT_NIC_IDX_LIST=""
 SERVER_NIC_IDX=0
+SERVER_ADDR="10.10.1.2:8888"
 NUMA_NODE=""
 SERVER_TIMEOUT=600
 CLIENT_TIMEOUT=650
-# WORKLOADS="ycsba ycsbb ycsbc"
-WORKLOADS="ycsba"
-# DISTS="uniform zipfian"
-# DISTS="uniform"
-DISTS="zipfian"
-SERVER_CORE_START=0  # first core pinned to server; expands to cover all server threads (server and client run on separate nodes, so no offset is needed; cores 32-63 are offline on this hardware)
+WORKLOADS="ycsba ycsbb ycsbc"
+DISTS="uniform zipfian"
+SERVER_CORE_START=32  # first core pinned to server; expands to cover all server threads (server and client run on separate nodes, so no offset is needed; cores 32-63 are offline on this hardware)
 MIN_SERVER_THREADS=""
 MAX_SERVER_THREADS=""
 LOG_DIR=""
@@ -73,6 +73,7 @@ for arg in "$@"; do
         --client-nodes=*)       CLIENT_NODES_LIST="${arg#*=}" ;;
         --client-nic-idx=*)     CLIENT_NIC_IDX_LIST="${arg#*=}" ;;
         --server-nic-idx=*)     SERVER_NIC_IDX="${arg#*=}" ;;
+        --server-addr=*)        SERVER_ADDR="${arg#*=}" ;;
         --numa-node=*)          NUMA_NODE="${arg#*=}" ;;
         --server-timeout=*)     SERVER_TIMEOUT="${arg#*=}" ;;
         --client-timeout=*)     CLIENT_TIMEOUT="${arg#*=}" ;;
@@ -318,7 +319,7 @@ for dist in $DISTS; do
     # hanging pthread_join forever. --client-timeout bounds that hang instead
     # of leaving it to run forever (see the wait loop below).
     SERVER_ARGS="--seconds=${SERVER_TIMEOUT} --nkeys=64000000 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist} --nic_idx=${SERVER_NIC_IDX}"
-    CLIENT_ARGS_COMMON="--server_addr=10.10.1.1:8888 --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
+    CLIENT_ARGS_COMMON="--server_addr=${SERVER_ADDR} --seconds=30 --nkeys=64000000 --bench_nkeys=10000000 --coros=2 --mem_threads=${server_threads} --workloads=${workload} --dists=${dist}"
 
     echo "###################################################"
     echo "[bench] server_threads=$server_threads workload=$workload dist=$dist"
